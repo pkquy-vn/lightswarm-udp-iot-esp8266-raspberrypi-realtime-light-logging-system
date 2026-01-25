@@ -2,78 +2,119 @@
 #include <WiFiUdp.h>
 
 // ===== Pins (NodeMCU / ESP8266) =====
-#define PHOTORESISTOR_PIN A0
-#define LED_INDICATOR 2   // GPIO2  (on-board LED, active LOW)
-#define LED_MASTER   16   // GPIO16 (on-board LED, active LOW)
+static const uint8_t PHOTORESISTOR_PIN = A0;
+static const uint8_t LED_INDICATOR     = 2;   // GPIO2  (on-board LED, active LOW)  blink by reading
+static const uint8_t LED_MASTER        = 16;  // GPIO16 (on-board LED, active LOW) steady ON if Master
 
 // ===== WiFi / UDP =====
 const char* ssid     = "TMOBILE";
 const char* password = "Uyen2812";
 
-const unsigned int localPort = 4210;
-const IPAddress broadcastIP(255, 255, 255, 255);
+static const uint16_t UDP_PORT = 4210;
+static const IPAddress BROADCAST_IP(255, 255, 255, 255);
 WiFiUDP udp;
 
 // ===== Timing =====
-unsigned long lastReceivedTime = 0;
-const unsigned long silentTime = 200;
-
-// ===== Device state =====
-int swarmID = -1;
-int analogValue = 0;
-bool isMaster = true;
-String role = "Master";
-
-// Store other devices readings by swarmID (0..9)
-int readings[10];
+static const uint32_t SILENT_MS = 200;
+static const uint32_t STATUS_PRINT_MS = 1000;
 
 // ===== Packet delimiters =====
-const String ESP_startBit = "~~~";
-const String ESP_endBit   = "---";
-const String RPi_startBit = "+++";
-const String RPi_endBit   = "***";
+static const char* ESP_START = "~~~";
+static const char* ESP_END   = "---";
+static const char* RPI_START = "+++";
+static const char* RPI_END   = "***";
 
-// ===== LED flashing mapping =====
-int Y_threshold = 24;
-int Y_interval  = 2010;
-int Z_threshold = 1024;
-int Z_interval  = 10;
-int slope, intercept;
+// ===== Device state =====
+static const int MAX_SWARM = 10;
+
+int swarmID = -1;
+int analogValue = 0;
+int readings[MAX_SWARM];
+
+uint32_t lastReceivedTime = 0;
+
+// ===== LED flashing mapping (same mapping you used) =====
+static const int X1 = 24;
+static const int Y1 = 2010;
+static const int X2 = 1024;
+static const int Y2 = 10;
+
+int slope = 0;
+int intercept = 0;
 
 // ===== LED states/timers =====
 bool ledIndicatorState = LOW;
-unsigned long ledIndicatorPreviousMillis = 0;
+uint32_t ledIndicatorPrevMs = 0;
 
-bool ledMasterState = LOW;
-unsigned long ledMasterPreviousMillis = 0;
+// ===== Logging state =====
+bool isMaster = true;
+bool prevIsMaster = true;
 
-void getSlopeIntercept(int x1, int y1, int x2, int y2, int *a, int *b) {
+uint32_t lastStatusPrint = 0;
+
+static inline uint32_t nowMs() {
+  return millis();
+}
+
+static void computeSlopeIntercept(int x1, int y1, int x2, int y2, int* a, int* b) {
   *a = (y2 - y1) / (x2 - x1);
   *b = y1 - (*a) * x1;
 }
 
-void ledIndicatorFlash(int analog_value) {
-  int ledInterval = slope * analog_value + intercept;
-  unsigned long currentMillis = millis();
-  if (currentMillis - ledIndicatorPreviousMillis >= (unsigned long)ledInterval) {
-    ledIndicatorPreviousMillis = currentMillis;
+static int clampInterval(int intervalMs) {
+  if (intervalMs < 5) return 5;
+  if (intervalMs > 5000) return 5000;
+  return intervalMs;
+}
+
+static void flashIndicatorByReading(int analogVal) {
+  int interval = slope * analogVal + intercept;
+  interval = clampInterval(interval);
+
+  uint32_t t = nowMs();
+  if (t - ledIndicatorPrevMs >= (uint32_t)interval) {
+    ledIndicatorPrevMs = t;
     ledIndicatorState = !ledIndicatorState;
     digitalWrite(LED_INDICATOR, ledIndicatorState);
   }
 }
 
-void ledMasterFlash(int analog_value) {
-  int ledInterval = slope * analog_value + intercept;
-  unsigned long currentMillis = millis();
-  if (currentMillis - ledMasterPreviousMillis >= (unsigned long)ledInterval) {
-    ledMasterPreviousMillis = currentMillis;
-    ledMasterState = !ledMasterState;
-    digitalWrite(LED_MASTER, ledMasterState);
-  }
+static void printRoleChangeIfNeeded(bool currentIsMaster, int value) {
+  if (currentIsMaster == prevIsMaster) return;
+  prevIsMaster = currentIsMaster;
+
+  Serial.printf("[%lu] ROLE %s  id=%d  value=%d\n",
+                (unsigned long)nowMs(),
+                currentIsMaster ? "MASTER" : "SLAVE",
+                swarmID,
+                value);
+}
+
+static void printResetEvent() {
+  Serial.printf("[%lu] EVENT reset_requested_by_rpi  id=%d\n",
+                (unsigned long)nowMs(),
+                swarmID);
+}
+
+static void printStatusIfDue(bool currentIsMaster, int value) {
+  uint32_t t = nowMs();
+  if (t - lastStatusPrint < STATUS_PRINT_MS) return;
+  lastStatusPrint = t;
+
+  Serial.printf("[%lu] STATUS id=%d role=%s value=%d\n",
+                (unsigned long)t,
+                swarmID,
+                currentIsMaster ? "MASTER" : "SLAVE",
+                value);
+}
+
+static bool startsWithEndsWith(const String& s, const char* start, const char* end) {
+  return s.startsWith(start) && s.endsWith(end);
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(10);
 
   pinMode(LED_INDICATOR, OUTPUT);
   pinMode(LED_MASTER, OUTPUT);
@@ -82,94 +123,102 @@ void setup() {
   digitalWrite(LED_INDICATOR, HIGH);
   digitalWrite(LED_MASTER, HIGH);
 
-  for (int i = 0; i < 10; i++) readings[i] = -1;
+  for (int i = 0; i < MAX_SWARM; i++) readings[i] = -1;
+
+  computeSlopeIntercept(X1, Y1, X2, Y2, &slope, &intercept);
 
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi...");
+  Serial.print("WiFi connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-  Serial.println("WiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 
   IPAddress ip = WiFi.localIP();
   swarmID = ip[3] % 10;
-  Serial.print("Swarm ID assigned: ");
-  Serial.println(swarmID);
 
-  udp.begin(localPort);
-  Serial.printf("Listening on UDP port %d\n", localPort);
+  Serial.printf("WiFi OK  ip=%d.%d.%d.%d  id=%d  port=%u\n",
+                ip[0], ip[1], ip[2], ip[3],
+                swarmID,
+                UDP_PORT);
 
-  getSlopeIntercept(Y_threshold, Y_interval, Z_threshold, Z_interval, &slope, &intercept);
+  udp.begin(UDP_PORT);
 
-  lastReceivedTime = millis();
+  lastReceivedTime = nowMs();
+  lastStatusPrint = nowMs();
+
+  isMaster = true;
+  prevIsMaster = true;
 }
 
 void loop() {
-  // Flash indicator LED based on current reading value (updated when silent)
-  ledIndicatorFlash(analogValue);
+  // Indicator LED always blinks based on last known analogValue
+  flashIndicatorByReading(analogValue);
 
-  // Master LED only flashes if Master, otherwise off
-  if (isMaster) {
-    ledMasterFlash(analogValue);
-  } else {
-    digitalWrite(LED_MASTER, HIGH);
-  }
+  // Master LED steady ON if Master, otherwise OFF
+  digitalWrite(LED_MASTER, isMaster ? LOW : HIGH);
 
-  // Receive packets
+  // ===== Receive packets =====
   int packetSize = udp.parsePacket();
-  if (packetSize) {
-    char incomingPacket[255];
-    int len = udp.read(incomingPacket, 254);
-    if (len > 0) incomingPacket[len] = '\0';
+  if (packetSize > 0) {
+    char incoming[255];
+    int len = udp.read(incoming, 254);
+    if (len > 0) incoming[len] = '\0';
 
-    String packetStr = String(incomingPacket);
+    String pkt(incoming);
 
-    // ESP -> ESP
-    if (packetStr.startsWith(ESP_startBit) && packetStr.endsWith(ESP_endBit)) {
-      String data = packetStr.substring(ESP_startBit.length(),
-                                        packetStr.length() - ESP_endBit.length());
-      int receivedSwarmID, receivedReading;
-      if (sscanf(data.c_str(), "%d,%d", &receivedSwarmID, &receivedReading) == 2) {
-        if (receivedSwarmID >= 0 && receivedSwarmID < 10) {
-          readings[receivedSwarmID] = receivedReading;
-          lastReceivedTime = millis();
+    // ESP -> ESP: ~~~<id>,<reading>---
+    if (startsWithEndsWith(pkt, ESP_START, ESP_END)) {
+      String data = pkt.substring(strlen(ESP_START), pkt.length() - strlen(ESP_END));
+      int rid = -1, rval = -1;
+      if (sscanf(data.c_str(), "%d,%d", &rid, &rval) == 2) {
+        if (rid >= 0 && rid < MAX_SWARM) {
+          readings[rid] = rval;
+          lastReceivedTime = nowMs();
         }
       }
     }
 
-    // RPi reset
-    if (packetStr.startsWith(RPi_startBit) && packetStr.endsWith(RPi_endBit)) {
-      String data = packetStr.substring(RPi_startBit.length(),
-                                        packetStr.length() - RPi_endBit.length());
+    // RPi reset: +++RESET_REQUESTED***
+    if (startsWithEndsWith(pkt, RPI_START, RPI_END)) {
+      String data = pkt.substring(strlen(RPI_START), pkt.length() - strlen(RPI_END));
       if (data == "RESET_REQUESTED") {
+        // Turn both LEDs OFF immediately (active LOW)
         digitalWrite(LED_INDICATOR, HIGH);
         digitalWrite(LED_MASTER, HIGH);
+
+        // Reset state
         isMaster = true;
-        Serial.println("RESET REQUESTED BY RPI");
+        prevIsMaster = true;
+        for (int i = 0; i < MAX_SWARM; i++) readings[i] = -1;
+
+        printResetEvent();
         delay(3000);
+
+        lastReceivedTime = nowMs();
       }
     }
   }
 
-  // If silent for 200ms, read sensor and broadcast
-  if (millis() - lastReceivedTime > silentTime) {
+  // ===== If silent for 200ms, read sensor and broadcast =====
+  if (nowMs() - lastReceivedTime > SILENT_MS) {
     analogValue = analogRead(PHOTORESISTOR_PIN);
 
     // ESP -> ESP broadcast
-    String message = ESP_startBit + String(swarmID) + "," + String(analogValue) + ESP_endBit;
-    udp.beginPacket(broadcastIP, localPort);
-    udp.write(message.c_str());
+    char espMsg[64];
+    snprintf(espMsg, sizeof(espMsg), "%s%d,%d%s", ESP_START, swarmID, analogValue, ESP_END);
+    udp.beginPacket(BROADCAST_IP, UDP_PORT);
+    udp.write((const uint8_t*)espMsg, strlen(espMsg));
     udp.endPacket();
-    lastReceivedTime = millis();
+
+    lastReceivedTime = nowMs();
 
     // Decide Master (highest reading)
     isMaster = true;
-    for (int i = 0; i < 10; i++) {
-      if (i != swarmID && readings[i] >= 0 && readings[i] > analogValue) {
+    for (int i = 0; i < MAX_SWARM; i++) {
+      if (i == swarmID) continue;
+      if (readings[i] >= 0 && readings[i] > analogValue) {
         isMaster = false;
         break;
       }
@@ -177,17 +226,15 @@ void loop() {
 
     // Master -> RPi broadcast
     if (isMaster) {
-      role = "Master";
-      String masterMessage = RPi_startBit + role + "," +
-                             String(swarmID) + "," +
-                             String(analogValue) + RPi_endBit;
-      udp.beginPacket(broadcastIP, localPort);
-      udp.write(masterMessage.c_str());
+      char rpiMsg[80];
+      snprintf(rpiMsg, sizeof(rpiMsg), "%sMaster,%d,%d%s", RPI_START, swarmID, analogValue, RPI_END);
+      udp.beginPacket(BROADCAST_IP, UDP_PORT);
+      udp.write((const uint8_t*)rpiMsg, strlen(rpiMsg));
       udp.endPacket();
-    } else {
-      role = "Slave";
     }
 
-    Serial.printf("Current role: %s (Reading: %d)\n", role.c_str(), analogValue);
+    // ===== Logs (minimal) =====
+    printRoleChangeIfNeeded(isMaster, analogValue);
+    printStatusIfDue(isMaster, analogValue);
   }
 }
