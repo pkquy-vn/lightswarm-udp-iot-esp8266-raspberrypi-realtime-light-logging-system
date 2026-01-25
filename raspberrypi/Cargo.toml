@@ -1,6 +1,8 @@
 [package]
 name = "raspberrypi"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+anyhow = "1"
+gpio-cdev = "0.6"
