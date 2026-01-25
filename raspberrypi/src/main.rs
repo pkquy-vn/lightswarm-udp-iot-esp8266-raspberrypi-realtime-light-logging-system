@@ -12,28 +12,42 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-// GPIO (BCM pins)
+// ===== GPIO (BCM pins) =====
 const BUTTON_PIN: u32 = 26;
 const WHITE_LED_PIN: u32 = 18;
 const RGB_LED_PINS: [u32; 3] = [17, 22, 27];
 
-// UDP / Protocol
+// ===== UDP / Protocol =====
 const PORT: u16 = 4210;
 const RPI_START: &str = "+++";
 const RPI_END: &str = "***";
 
-// Blink mapping
+// ===== Blink mapping (same mapping as your ESP) =====
 const X1: f64 = 24.0;
 const Y1: f64 = 2010.0 / 1000.0;
 const X2: f64 = 1024.0;
 const Y2: f64 = 10.0 / 1000.0;
 
+// ===== Terminal logging rate =====
+const STATUS_PRINT_MS: u64 = 1000;
+
+// ===== State =====
 #[derive(Debug)]
 struct SharedState {
     swarm_to_led: HashMap<String, usize>,
     next_led_index: usize,
+
+    // Blink state for the currently blinking LED (only one should blink: the current Master)
     led_state: bool,
     previous_toggle: Instant,
+
+    // For terminal output
+    last_master_id: Option<String>,
+    last_reading: Option<i32>,
+    last_status_print: Instant,
+
+    // Program start for timestamps
+    start: Instant,
 }
 
 impl SharedState {
@@ -43,6 +57,23 @@ impl SharedState {
             next_led_index: 0,
             led_state: false,
             previous_toggle: Instant::now(),
+            last_master_id: None,
+            last_reading: None,
+            last_status_print: Instant::now(),
+            start: Instant::now(),
+        }
+    }
+
+    fn ts_ms(&self) -> u128 {
+        self.start.elapsed().as_millis()
+    }
+
+    fn led_label(idx: usize) -> &'static str {
+        match idx {
+            0 => "LED0",
+            1 => "LED1",
+            2 => "LED2",
+            _ => "LED?",
         }
     }
 
@@ -61,6 +92,9 @@ impl SharedState {
         self.next_led_index = 0;
         self.led_state = false;
         self.previous_toggle = Instant::now();
+        self.last_master_id = None;
+        self.last_reading = None;
+        self.last_status_print = Instant::now();
     }
 }
 
@@ -117,12 +151,16 @@ fn append_log(swarm_id: &str, reading: i32) -> Result<()> {
     Ok(())
 }
 
+// Accepts payloads:
+// 1) +++Master,<swarm_id>,<reading>***
+// 2) +++<swarm_id>,<reading>***    (optional fallback)
 fn parse_message(payload: &str) -> Option<(String, i32)> {
     if !payload.starts_with(RPI_START) || !payload.ends_with(RPI_END) {
         return None;
     }
     let inner = &payload[RPI_START.len()..payload.len() - RPI_END.len()];
 
+    // ignore reset packets
     if inner == "RESET_REQUESTED" {
         return None;
     }
@@ -157,7 +195,7 @@ fn blink_interval_seconds(reading: i32) -> f64 {
 }
 
 fn main() -> Result<()> {
-    // UDP init
+    // ===== UDP init =====
     let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, PORT))
         .with_context(|| format!("Failed to bind UDP port {PORT}"))?;
     sock.set_broadcast(true).context("Failed to enable broadcast")?;
@@ -166,20 +204,18 @@ fn main() -> Result<()> {
 
     let sock_send = sock.try_clone().context("Failed to clone UDP socket")?;
 
-    println!("Listening on UDP port {PORT}...");
-
-    // Shared state
+    // ===== Shared state =====
     let reset_flag = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(SharedState::new()));
 
-    // GPIO command channel
+    // ===== GPIO command channel =====
     let (tx, rx) = mpsc::channel::<GpioCmd>();
 
-    // GPIO thread owns ALL gpio handles (NO CLONE)
+    // ===== GPIO thread owns ALL gpio handles =====
     let reset_flag_gpio = Arc::clone(&reset_flag);
     let state_gpio = Arc::clone(&state);
 
-    let gpio_thread = thread::spawn(move || -> Result<()> {
+    let _gpio_thread = thread::spawn(move || -> Result<()> {
         let mut chip = open_chip()?;
         let button = request_input(&mut chip, BUTTON_PIN, "button")?;
         let white_led = request_output(&mut chip, WHITE_LED_PIN, "white_led", 0)?;
@@ -224,7 +260,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            // button press
+            // button press (assumes v=1 unpressed, v=0 pressed)
             let v = button.get_value().unwrap_or(0);
             if v == 0 && prev_btn == 1 {
                 reset_flag_gpio.store(true, Ordering::SeqCst);
@@ -238,6 +274,7 @@ fn main() -> Result<()> {
                 let _ = truncate_log();
                 {
                     let mut st = state_gpio.lock().unwrap();
+                    println!("[{}] EVENT reset_button  broadcast=RESET  white_led=3s", st.ts_ms());
                     st.reset();
                 }
 
@@ -257,8 +294,14 @@ fn main() -> Result<()> {
         }
     });
 
-    // UDP receive loop in main thread
+    // ===== Startup terminal output =====
+    println!("RPI UDP listener on port {PORT}");
+    println!("GPIO: button=BCM{BUTTON_PIN} white=BCM{WHITE_LED_PIN} rgb={:?}", RGB_LED_PINS);
+    println!("Protocol: master packets: +++Master,<id>,<reading>***");
+
+    // ===== UDP receive loop =====
     let mut buf = [0u8; 1024];
+
     loop {
         if reset_flag.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(50));
@@ -276,26 +319,73 @@ fn main() -> Result<()> {
                     continue;
                 };
 
-                println!("Swarm {} -> {}", swarm_id, reading);
+                // Log to file (keep behavior)
                 let _ = append_log(&swarm_id, reading);
 
-                let led_index = {
-                    let mut st = state.lock().unwrap();
-                    st.assign_led_index(&swarm_id)
-                };
+                // Update state once, compute everything we need, then do GPIO cmd
+                let (ts_ms, led_index, led_label, interval, on, master_changed, status_due, prev_master) =
+                    {
+                        let mut st = state.lock().unwrap();
 
-                let interval = Duration::from_secs_f64(blink_interval_seconds(reading));
+                        let prev_master = st.last_master_id.clone();
+                        let master_changed = match &st.last_master_id {
+                            Some(id) => id != &swarm_id,
+                            None => true,
+                        };
 
-                let on = {
-                    let mut st = state.lock().unwrap();
-                    if st.previous_toggle.elapsed() >= interval {
-                        st.previous_toggle = Instant::now();
-                        st.led_state = !st.led_state;
+                        st.last_master_id = Some(swarm_id.clone());
+                        st.last_reading = Some(reading);
+
+                        let led_index = st.assign_led_index(&swarm_id);
+                        let interval = Duration::from_secs_f64(blink_interval_seconds(reading));
+
+                        if st.previous_toggle.elapsed() >= interval {
+                            st.previous_toggle = Instant::now();
+                            st.led_state = !st.led_state;
+                        }
+                        let on = st.led_state;
+
+                        let status_due = st.last_status_print.elapsed()
+                            >= Duration::from_millis(STATUS_PRINT_MS);
+                        if status_due {
+                            st.last_status_print = Instant::now();
+                        }
+
+                        (
+                            st.ts_ms(),
+                            led_index,
+                            SharedState::led_label(led_index),
+                            interval,
+                            on,
+                            master_changed,
+                            status_due,
+                            prev_master,
+                        )
+                    };
+
+                // terminal output (minimal)
+                if master_changed {
+                    if let Some(prev) = prev_master {
+                        println!(
+                            "[{ts_ms}] EVENT master_change  from={prev}  to={swarm_id}  {led_label}"
+                        );
+                    } else {
+                        println!("[{ts_ms}] EVENT master_set  to={swarm_id}  {led_label}");
                     }
-                    st.led_state
-                };
+                }
 
-                let _ = tx.send(GpioCmd::BlinkRgb { idx: led_index, on });
+                if status_due {
+                    let ms = interval.as_millis();
+                    println!(
+                        "[{ts_ms}] STATUS master={swarm_id} value={reading} blink={ms}ms {led_label}"
+                    );
+                }
+
+                // Drive RGB LED
+                let _ = tx.send(GpioCmd::BlinkRgb {
+                    idx: led_index,
+                    on,
+                });
             }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::WouldBlock
@@ -306,8 +396,4 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    // unreachable
-    // let _ = gpio_thread.join();
-    // Ok(())
 }
