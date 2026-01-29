@@ -72,7 +72,7 @@ No IP addresses are hard-coded anywhere in the system.
 
 ### ESP8266 and Raspberry Pi Setup
 
-![ESP8266 and Raspberry Pi Setup](Hardware_Setup.JPG)
+![ESP8266 and Raspberry Pi Setup](Hardware_Setup.jpg)
 
 ---
 
