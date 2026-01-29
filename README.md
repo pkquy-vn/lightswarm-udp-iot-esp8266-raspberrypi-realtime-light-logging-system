@@ -114,11 +114,8 @@ Each ESP8266 device runs the same firmware and behaves as follows:
 #### ESP8266 Swarm Communication
 - Each ESP8266 broadcasts its reading when the network is silent for 200 ms
 - Message format:
-```
-- Each node stores the most recent readings from other swarm members
-- Swarm IDs are derived dynamically from the device’s IP address
-
----
+  - Each node stores the most recent readings from other swarm members
+  - Swarm IDs are derived dynamically from the device’s IP address
 
 #### Master Election Logic
 - After broadcasting, each ESP8266 compares its reading with others
@@ -130,7 +127,7 @@ Each ESP8266 device runs the same firmware and behaves as follows:
 #### Master Behavior
 - Turns ON the second built-in LED (GPIO16)
 - Broadcasts data to the Raspberry Pi using:
-```
+```text
 +++Master,<swarm_id>,<reading>***
 ```
 - Non-Master nodes do not send data to the Raspberry Pi
