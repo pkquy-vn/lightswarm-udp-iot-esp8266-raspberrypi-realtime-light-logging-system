@@ -243,14 +243,13 @@ lightswarm-udp-iot-esp8266-raspberrypi/
 ├── esp8266/
 │   ├── src/
 │   │   └── main.cpp
-│   ├── platformio.ini
-│   └── README.md
+│   └── platformio.ini
+│
 ├── raspberrypi/
 │   ├── src/
 │   │   └── main.rs
-│   ├── Cargo.toml
-│   └── README.md
-├── sensor_readings.txt
+│   └── Cargo.toml
+│
 └── README.md
 ```
 
